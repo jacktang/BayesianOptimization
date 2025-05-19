@@ -2,6 +2,11 @@
 Example of SAAS-based Bayesian Optimization on a 10D test function
 where only 2 dimensions are relevant.
 """
+import os, sys
+
+cwd = os.getcwd()
+basedir = os.path.realpath(f"{cwd}/../")
+sys.path.append(basedir)
 
 import numpy as np
 import matplotlib.pyplot as plt
