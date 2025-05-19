@@ -140,7 +140,7 @@ def test_upper_confidence_bound(gp, target_space, random_state):
     assert acq.kappa == 0.5
 
 
-def test_l_bfgs_fails(target_space, random_state):
+def test_smart_minimize_fails(target_space, random_state):
     acq = acquisition.UpperConfidenceBound(random_state=random_state)
 
     def fun(x):
@@ -149,7 +149,7 @@ def test_l_bfgs_fails(target_space, random_state):
         except IndexError:
             return np.nan
 
-    _, min_acq_l = acq._l_bfgs_b_minimize(fun, space=target_space, x_seeds=np.array([[2.5, 0.5]]))
+    _, min_acq_l = acq._smart_minimize(fun, space=target_space, x_seeds=np.array([[2.5, 0.5]]))
     assert min_acq_l == np.inf
 
 
@@ -407,7 +407,10 @@ def verify_optimizers_match(optimizer1, optimizer2):
     rng = np.random.default_rng()
     assert rng.bit_generator.state["state"]["state"] == rng.bit_generator.state["state"]["state"]
 
-    assert optimizer1._gp.kernel.get_params() == optimizer2._gp.kernel.get_params()
+    kernel_params1 = optimizer1._gp.kernel.get_params()
+    kernel_params2 = optimizer2._gp.kernel.get_params()
+    for k in kernel_params1:
+        assert (np.array(kernel_params1[k]) == np.array(kernel_params2[k])).all()
 
     suggestion1 = optimizer1.suggest()
     suggestion2 = optimizer2.suggest()
