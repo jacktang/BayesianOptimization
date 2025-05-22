@@ -61,6 +61,9 @@ class ConstraintModel:
         random_state: int | RandomState | None = None,
     ) -> None:
         self.fun = fun
+        self._n_features_in = None  # Will be set during first fit
+        self._X_train = None  # Store training data
+        self._Y_train = None
 
         self._lb = np.atleast_1d(lb)
         self._ub = np.atleast_1d(ub)
@@ -139,16 +142,30 @@ class ConstraintModel:
         Y : np.ndarray of shape (n_samples, n_constraints)
             Values of the constraint function.
 
-
         Returns
         -------
         None
         """
+        # Store number of features on first fit
+        if self._n_features_in is None:
+            self._n_features_in = X.shape[1]
+            
+        # Initialize or update training data
+        if self._X_train is None:
+            self._X_train = X
+            self._Y_train = Y
+        else:
+            self._X_train = np.vstack([self._X_train, X])
+            if len(Y.shape) == 1:
+                Y = Y.reshape(-1, 1) if len(self._Y_train.shape) > 1 else Y
+            self._Y_train = np.vstack([self._Y_train, Y]) if len(self._Y_train.shape) > 1 else np.concatenate([self._Y_train, Y])
+
+        # Fit models with all available data
         if len(self._model) == 1:
-            self._model[0].fit(X, Y)
+            self._model[0].fit(self._X_train, self._Y_train)
         else:
             for i, gp in enumerate(self._model):
-                gp.fit(X, Y[:, i])
+                gp.fit(self._X_train, self._Y_train[:, i])
 
     def predict(self, X: NDArray[Float]) -> NDArray[Float]:
         r"""Calculate the probability that the constraint is fulfilled at `X`.
@@ -170,7 +187,6 @@ class ConstraintModel:
 
         Note
         ----
-
         In case of multiple constraints, we assume conditional independence.
         This means we calculate the probability of constraint fulfilment
         individually, with the joint probability given as their product.
@@ -181,15 +197,16 @@ class ConstraintModel:
             Parameters for which to predict the probability of constraint
             fulfilment.
 
-
         Returns
         -------
         np.ndarray of shape (n_samples,)
             Probability of constraint fulfilment.
-
         """
+        if self._n_features_in is None or self._X_train is None:
+            raise ValueError("Model must be fit before calling predict")
+
         X_shape = X.shape
-        X = X.reshape((-1, self._model[0].n_features_in_))
+        X = X.reshape((-1, self._n_features_in))
 
         result: NDArray[Float]
         y_mean: NDArray[Float]

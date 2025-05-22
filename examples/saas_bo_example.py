@@ -114,7 +114,7 @@ def main():
     optimizer = SAASBayesianOptimization(
         f=test_function,
         pbounds=pbounds,
-        alpha=0.1,             # SAAS sparsity parameter
+        alpha=0.5,             # SAAS sparsity parameter
         num_warmup=128,        # Reduced for demo purposes
         num_samples=64,        # Reduced for demo purposes
         thinning=4,            # Thinning to reduce computation

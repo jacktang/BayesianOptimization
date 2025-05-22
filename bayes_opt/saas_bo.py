@@ -16,6 +16,7 @@ from bayes_opt.domain_reduction import DomainTransformer
 from bayes_opt.target_space import TargetSpace
 from bayes_opt.saasgp import SAASGP
 from bayes_opt.saasei import SAASExpectedImprovement
+from bayes_opt.constraint import ConstraintModel
 
 
 class SAASBayesianOptimization:
@@ -31,6 +32,8 @@ class SAASBayesianOptimization:
     pbounds : dict
         Dictionary with parameters names as keys and a tuple with minimum
         and maximum values as values.
+    constraint : NonlinearConstraint, optional (default=None)
+        Constraint function and bounds. If provided, the optimization will be constrained.
     alpha : float, default=0.1
         Controls sparsity in the SAAS prior.
     num_warmup : int, default=256
@@ -53,6 +56,7 @@ class SAASBayesianOptimization:
         self,
         f: Callable,
         pbounds: Mapping[str, Tuple[float, float]],
+        constraint: Optional[NonlinearConstraint] = None,
         alpha: float = 0.1,
         num_warmup: int = 256,
         num_samples: int = 256,
@@ -63,16 +67,30 @@ class SAASBayesianOptimization:
         verbose: int = 1,
         bounds_transformer: Optional[DomainTransformer] = None,
         allow_duplicate_points: bool = False,
-        constraint: Optional[NonlinearConstraint] = None,
     ):
         self._random_state = ensure_rng(random_state)
         self._verbose = verbose
         self._allow_duplicate_points = allow_duplicate_points
         self._bounds_transformer = bounds_transformer
         
+        # Process constraint if provided
+        if constraint is not None:
+            self._constraint = ConstraintModel(
+                fun=constraint.fun,
+                lb=constraint.lb,
+                ub=constraint.ub,
+                random_state=random_state
+            )
+            self.is_constrained = True
+        else:
+            self._constraint = None
+            self.is_constrained = False
+        
         # Create target space
         self._space = TargetSpace(
-            f, pbounds, random_state=random_state, 
+            f, pbounds, 
+            constraint=self._constraint,
+            random_state=random_state, 
             allow_duplicate_points=allow_duplicate_points
         )
         
@@ -118,6 +136,11 @@ class SAASBayesianOptimization:
     def res(self) -> list:
         """Get all target values and corresponding parameters."""
         return self._space.res()
+    
+    @property
+    def constraint(self) -> Optional[ConstraintModel]:
+        """Return the constraint associated with the optimizer, if any."""
+        return self._constraint
     
     def _fit_gp(self):
         """Fit the GP model with the current data."""
@@ -200,60 +223,76 @@ class SAASBayesianOptimization:
         if len(self._space) < 2:
             if self._verbose:
                 print("Not enough data for GP model. Using random sampling.")
-            return self._space.random_sample()
+            params = self._space.random_sample()
+            return self._space.array_to_params(params) if isinstance(params, np.ndarray) else params
         
         # Always refit the GP with all current data
         fit_success = self._fit_gp()
         if not fit_success:
             print("GP fitting failed. Using random sampling.")
-            return self._space.random_sample()
+            params = self._space.random_sample()
+            return self._space.array_to_params(params) if isinstance(params, np.ndarray) else params
         
-        try:
-            # Find the best observed value
+        # Find the best feasible value
+        if self.is_constrained:
+            feasible_targets = []
+            for res in self._space.res():
+                if res.get('allowed', False):  # Only consider allowed points
+                    feasible_targets.append(res['target'])
+            y_best = max(feasible_targets) if feasible_targets else float('-inf')
+        else:
             y_best = np.max(self._space.target)
+        
+        # Generate random points
+        bounds = self._space.bounds
+        random_points = np.zeros((n_random, self._space.dim))
+        for i, (lower, upper) in enumerate(bounds):
+            random_points[:, i] = self._random_state.uniform(lower, upper, size=n_random)
+        
+        # Evaluate acquisition function at random points
+        # try:
+        # Pass constraint directly to acquisition function
+        acq_values = self._acquisition_function(
+            self._gp, 
+            random_points, 
+            y_best,
+            constraint=self._constraint if self.is_constrained else None
+        )
+        # except Exception as e:
+        #     print(f"Error in acquisition function evaluation: {e}")
+        #     print("Falling back to random sampling.")
+        #     params = self._space.random_sample()
+        #     return self._space.array_to_params(params) if isinstance(params, np.ndarray) else params
+        
+        # Find the best point from random sampling
+        if len(acq_values) == 0 or np.all(np.isnan(acq_values)):
+            print("All acquisition values are invalid. Using random sampling.")
+            params = self._space.random_sample()
+            return self._space.array_to_params(params) if isinstance(params, np.ndarray) else params
             
-            # Generate random points
-            bounds = self._space.bounds
-            random_points = np.zeros((n_random, self._space.dim))
-            for i, (lower, upper) in enumerate(bounds):
-                random_points[:, i] = self._random_state.uniform(lower, upper, size=n_random)
+        # Filter out NaNs if any
+        valid_indices = ~np.isnan(acq_values)
+        if not np.any(valid_indices):
+            print("No valid acquisition values. Using random sampling.")
+            params = self._space.random_sample()
+            return self._space.array_to_params(params) if isinstance(params, np.ndarray) else params
             
-            # Evaluate acquisition function at random points
-            try:
-                acq_values = self._acquisition_function(self._gp, random_points, y_best)
-            except Exception as e:
-                print(f"Error in acquisition function evaluation: {e}")
-                print("Falling back to random sampling.")
-                return self._space.random_sample()
+        acq_values = acq_values[valid_indices]
+        random_points = random_points[valid_indices]
+        
+        best_idx = np.argmax(acq_values)
+        x_best = random_points[best_idx]
+        
+        # Convert the suggested point to a dictionary
+        return self._space.array_to_params(x_best)
             
-            # Find the best point from random sampling
-            if len(acq_values) == 0 or np.all(np.isnan(acq_values)):
-                print("All acquisition values are invalid. Using random sampling.")
-                return self._space.random_sample()
-                
-            # Filter out NaNs if any
-            valid_indices = ~np.isnan(acq_values)
-            if not np.any(valid_indices):
-                print("No valid acquisition values. Using random sampling.")
-                return self._space.random_sample()
-                
-            acq_values = acq_values[valid_indices]
-            random_points = random_points[valid_indices]
-            
-            best_idx = np.argmax(acq_values)
-            x_best = random_points[best_idx]
-            
-            # Convert the suggested point to a dictionary
-            return dict(zip(self._space.keys, x_best))
-            
-        except Exception as e:
-            import traceback
-            print(f"Error during suggestion generation: {e}")
-            print(f"Traceback: {traceback.format_exc()}")
-            print("Falling back to random sampling.")
-            return self._space.random_sample()
-    
-    def register(self, params: Dict[str, float], target: float) -> None:
+ 
+    def register(
+        self, 
+        params: Dict[str, float], 
+        target: float,
+        constraint_value: Optional[Union[float, np.ndarray]] = None
+    ) -> None:
         """Register an observation (parameters and target value).
         
         Parameters
@@ -262,8 +301,14 @@ class SAASBayesianOptimization:
             Dictionary with the parameter values.
         target : float
             Target function value.
+        constraint_value : float or numpy.ndarray, optional
+            Value(s) of the constraint function(s) at the observation.
         """
-        self._space.register(params, target)
+        if self.is_constrained and constraint_value is None:
+            # If constrained but no constraint value provided, evaluate constraint
+            constraint_value = self._constraint.fun(**params)
+        
+        self._space.register(params, target, constraint_value)
     
     def maximize(
         self,
@@ -283,20 +328,70 @@ class SAASBayesianOptimization:
             Number of MCMC samples for acquisition function evaluation.
         """
         # Generate initial random points
+        initial_points = []
+        initial_targets = []
+        initial_constraints = []
+        
         for _ in range(init_points):
-            self._space.probe(self._space.random_sample())
+            params = self._space.random_sample()
+            # Convert array to dictionary if needed
+            if isinstance(params, np.ndarray):
+                params = self._space.array_to_params(params)
+            
+            # Evaluate target function
+            target = self._space.target_func(**params)
+            
+            # Evaluate constraint if present
+            constraint_value = None
+            if self.is_constrained:
+                constraint_value = self._constraint.fun(**params)
+            
+            # Store values
+            initial_points.append(self._space.params_to_array(params))
+            initial_targets.append(target)
+            if constraint_value is not None:
+                initial_constraints.append(constraint_value)
+            
+            # Register the point
+            self.register(params, target, constraint_value)
+            
+            if self._verbose >= 1:
+                status = "allowed" if not self.is_constrained or self._constraint.allowed(constraint_value) else "not allowed"
+                print(f"Initial point {_+1}/{init_points} | Target: {target:.4f} | Status: {status}")
+        
+        # Fit constraint model with initial points if using constraints
+        if self.is_constrained and initial_constraints:
+            X_init = np.vstack(initial_points)
+            Y_init = np.vstack(initial_constraints) if len(initial_constraints[0].shape) > 0 else np.array(initial_constraints)
+            self._constraint.fit(X_init, Y_init)
         
         # Main Bayesian optimization loop
         for i in range(n_iter):
             # Find the next point to probe
-            next_point = self.suggest()
+            next_point = self.suggest()  # This now always returns a dictionary
             
-            # Probe the point
-            target = self._space.probe(next_point)
+            # Evaluate target function
+            target = self._space.target_func(**next_point)
+            
+            # Evaluate constraint if present
+            constraint_value = None
+            if self.is_constrained:
+                constraint_value = self._constraint.fun(**next_point)
+                
+                # Update constraint model with new point
+                X_new = self._space.params_to_array(next_point).reshape(1, -1)
+                Y_new = np.array(constraint_value).reshape(1, -1) if isinstance(constraint_value, np.ndarray) else np.array([constraint_value])
+                self._constraint.fit(X_new, Y_new)
+            
+            # Register the point
+            self.register(next_point, target, constraint_value)
             
             if self._verbose >= 1:
                 current_max = self._space.max()
-                print(f"Iteration {i+1}/{n_iter} | Target: {target:.4f} | Best: {current_max['target']:.4f}")
+                if current_max is not None:
+                    best_target = current_max["target"]
+                    status = "allowed" if not self.is_constrained or self._constraint.allowed(constraint_value) else "not allowed"
+                    print(f"Iteration {i+1}/{n_iter} | Target: {target:.4f} | Best: {best_target:.4f} | Status: {status}")
                 
             # Apply bounds transformer if provided
             if self._bounds_transformer and i >= init_points:
@@ -314,6 +409,20 @@ class SAASBayesianOptimization:
         
         if self._bounds_transformer:
             self._bounds_transformer.initialize(self._space)
+
+    def get_relevance_scores(self) -> np.ndarray:
+        """Get the relevance scores for each dimension.
+        
+        Returns
+        -------
+        numpy.ndarray
+            Array of relevance scores for each dimension.
+            Higher scores indicate more relevant dimensions.
+        """
+        if not hasattr(self._gp, 'relevance_scores_'):
+            # If GP hasn't been fit yet or doesn't have scores, return zeros
+            return np.zeros(self._space.dim)
+        return self._gp.relevance_scores_
 
 
 # Example usage function

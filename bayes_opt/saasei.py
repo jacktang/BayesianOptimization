@@ -24,7 +24,7 @@ class SAASExpectedImprovement:
         else:
             self.random_state = np.random.RandomState()
             
-    def __call__(self, gp, X, y_best):
+    def __call__(self, gp, X, y_best, constraint=None):
         """
         Calculate expected improvement at points X based on MCMC samples.
         
@@ -36,52 +36,47 @@ class SAASExpectedImprovement:
             Points at which to calculate the acquisition function.
         y_best : float
             The current best observed value.
+        constraint : ConstraintModel, optional
+            Constraint model for constrained optimization.
             
         Returns
         -------
         ei : array-like of shape (n_samples,)
             Expected improvement at points X.
         """
-        import traceback
-        print(f"DEBUG - SAASExpectedImprovement.__call__: X shape={np.array(X).shape}, y_best={y_best}")
+        # Get mean and standard deviation predictions using MCMC samples
+        mean, std = gp.predict(X, return_std=True)
         
-        # Add logging of GP state
-        print(f"TRACE - SAASExpectedImprovement.__call__: GP state - X_train_: {gp.X_train_.shape}, Y_train: {gp.Y_train.shape}")
-        print(f"TRACE - SAASExpectedImprovement.__call__: GP Ls: {'None' if gp.Ls is None else gp.Ls.shape}")
+        # Calculate improvement
+        # Dynamically adjust xi based on optimization progress
+        n_points = len(gp.X_train_)
+        adaptive_xi = self.xi * np.exp(-0.1 * n_points)  # Decrease exploration over time
+        improvement = mean - y_best - adaptive_xi
         
-        try:
-            # Get mean and standard deviation predictions using MCMC samples
-            print("TRACE - SAASExpectedImprovement.__call__: Calling gp.predict()...")
-            mean, std = gp.predict(X, return_std=True)
-            print(f"DEBUG - EI calculation: mean shape={mean.shape}, std shape={std.shape}")
+        # Calculate Z score with numerical stability
+        z = improvement / (std + 1e-9)
+        
+        # Calculate expected improvement using analytical formula
+        ei = improvement * norm.cdf(z) + std * norm.pdf(z)
+        
+        # Set EI to 0 where std is 0 (no uncertainty)
+        ei = jnp.where(std == 0, 0.0, ei)
+        
+        # Handle constraints if present
+        if constraint is not None:
+            # Get probability of satisfying constraints
+            prob_feasible = constraint.predict(X)
             
-            # Calculate improvement
-            improvement = mean - y_best - self.xi
+            # Calculate constrained expected improvement
+            # Use a softer penalty for points near constraint boundaries
+            penalty = 1.0 / (1.0 + np.exp(-10 * (prob_feasible - 0.5)))
+            ei = ei * penalty
+        
+        # Convert to numpy array for compatibility
+        return np.array(ei)
             
-            # Calculate Z score
-            z = improvement / (std + 1e-9)
-            
-            # Calculate expected improvement using analytical formula
-            ei = improvement * norm.cdf(z) + std * norm.pdf(z)
-            
-            # Set EI to 0 where std is 0 (no uncertainty)
-            # Use jnp.where instead of direct assignment since JAX arrays are immutable
-            ei = jnp.where(std == 0, 0.0, ei)
-            
-            print(f"DEBUG - EI result shape={ei.shape}")
-            
-            # Convert to numpy array for compatibility
-            return np.array(ei)
-        except Exception as e:
-            print(f"ERROR in acquisition function: {e}")
-            print(f"TRACE - Exception information:")
-            print(f"  GP model state: X_train_={gp.X_train_.shape}, Y_train={gp.Y_train.shape}")
-            print(f"  GP Ls shape: {'None' if gp.Ls is None else gp.Ls.shape}")
-            print(f"Traceback: {traceback.format_exc()}")
-            # Return zeros as a fallback
-            return np.zeros(X.shape[0])
     
-    def sample_based_ei(self, gp, X, y_best, n_samples=32):
+    def sample_based_ei(self, gp, X, y_best, constraint=None, n_samples=32):
         """
         Calculate expected improvement at points X using direct MCMC samples.
         
@@ -96,6 +91,8 @@ class SAASExpectedImprovement:
             Points at which to calculate the acquisition function.
         y_best : float
             The current best observed value.
+        constraint : ConstraintModel, optional
+            Constraint model for constrained optimization.
         n_samples : int, default=32
             Number of MCMC samples to use for the calculation.
             
@@ -108,9 +105,23 @@ class SAASExpectedImprovement:
         y_samples = gp.sample_y(X, n_samples=n_samples)
         
         # Calculate improvement for each sample
-        improvement = np.maximum(y_samples - y_best - self.xi, 0)
+        # Use adaptive xi here too
+        n_points = len(gp.X_train_)
+        adaptive_xi = self.xi * np.exp(-0.1 * n_points)
+        improvement = np.maximum(y_samples - y_best - adaptive_xi, 0)
         
         # Average over samples
         expected_improvement = np.mean(improvement, axis=1)
+        
+        # Handle constraints if present
+        if constraint is not None:
+            try:
+                prob_feasible = constraint.predict(X)
+                penalty = 1.0 / (1.0 + np.exp(-10 * (prob_feasible - 0.5)))
+                expected_improvement = expected_improvement * penalty
+            except ValueError as e:
+                # If constraint model hasn't been fit yet, return unconstrained EI
+                print(f"Warning: {str(e)}. Using unconstrained EI.")
+                pass
         
         return expected_improvement

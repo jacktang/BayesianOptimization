@@ -232,6 +232,13 @@ class SAASGP(object):
         
         self.rng_key_hmc, self.rng_key_predict = random.split(random.PRNGKey(seed), 2)
         self.chain_samples, self.flat_samples, self.summary = self.run_inference(self.rng_key_hmc, X_train, Y_train)
+        
+        # Compute relevance scores from inverse length scales
+        inv_length_sq = self.flat_samples["kernel_inv_length_sq"][::self.thinning]
+        # Average over MCMC samples and normalize
+        self.relevance_scores_ = np.mean(inv_length_sq, axis=0)
+        self.relevance_scores_ = self.relevance_scores_ / np.sum(self.relevance_scores_)
+        
         return self
 
     def predict(self, X_test, return_std=False, return_cov=False, return_var=False):
